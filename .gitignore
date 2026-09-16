@@ -59,7 +59,7 @@ autoconf/autom4te.cache
 .agents/
 /CLAUDE.md
 /instructions.md
-.claude/
+#.claude/
 /GEMINI.md
 .gemini/
 AGENTS.md
