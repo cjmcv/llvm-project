@@ -10,6 +10,49 @@
 ///
 //===----------------------------------------------------------------------===//
 
+// <NT> 文件简介:
+//   RISCVMCTargetDesc.cpp 是 RISC-V 后端 MCTargetDesc 子目录的总入口. 它的
+//   唯一职责是提供 extern "C" 接口 (LLVMInitializeRISCVTargetMC 等), 把所有
+//   RISC-V 子模块 (InstPrinter / CodeEmitter / AsmBackend / AsmParser /
+//   Disassembler / TargetStreamer / ObjectWriter / MCAsmInfo / MCObjectFileInfo
+//   / MCInstrAnalysis / MCInstrInfo / MCRegisterInfo / MCSubtargetInfo) 注入
+//   TargetRegistry. 上游 llvm-mc / llc / clang / llvm-objdump / lld 等任何
+//   RISC-V 工具启动都会调本文件的某个 LLVMInitialize* 函数.
+
+// <NT> 关键函数串联 (RISC-V 工具启动主流程):
+//   入口 (extern "C"):
+//     LLVMInitializeRISCVTargetMC
+//       ├─ RegisterMCAsmInfo           <- RISCVMCAsmInfo
+//       ├─ RegisterMCInstrInfo         <- RISCVGenInstrInfo (td 自动生成)
+//       ├─ RegisterMCRegisterInfo      <- RISCVGenRegisterInfo (td 自动生成)
+//       ├─ RegisterMCSubtargetInfo     <- RISCVMCSubtargetInfo
+//       ├─ RegisterMCInstrAnalysis     <- RISCVInstrAnalysis
+//       ├─ RegisterMCAsmBackend        <- RISCVAsmBackend (ELF) / DarwinRISCVAsmBackend
+//       ├─ RegisterMCCodeEmitter       <- createRISCVMCCodeEmitter
+//       ├─ RegisterELFStreamer         <- createRISCVELFStreamer
+//       ├─ RegisterELFObjectWriter     <- createRISCVELFObjectWriter
+//       ├─ RegisterMachOObjectWriter   <- createRISCVMachObjectWriter
+//       └─ RegisterAsmTargetStreamer   <- createRISCVObjectTargetStreamer
+//     LLVMInitializeRISCVTargetInfo
+//       └─ RegisterTarget              <- getTheRISCV32Target / getTheRISCV64Target
+//                                          (让 Triple("riscv64-...-elf") 解析到 RISCV 后端)
+
+//   注: RegisterMCAsmParser / RegisterMCDisassembler 在各自的 AsmParser.cpp /
+//      Disassembler.cpp 文件里独立 Register, 不在本文件. 这里只负责 MC 层.
+
+// <NT> 总结:
+//   本文件是 RISC-V 后端对外暴露的总闸口. 三大职责:
+//     1) Target 注册: 让 LLVM 的所有 RISC-V 工具 (clang -target riscv64 /
+//        llc -mtriple=riscv64 / llvm-mc -triple=riscv64) 在加载时找到
+//        本后端的实现, 而非抛 "no available targets" 错误.
+//     2) 模块串接: 把分散在 13 个 MCTargetDesc 文件里的实现全部注册到
+//        TargetRegistry, 各工具启动时按需查找.
+//     3) td 包含: 通过 GET_INSTRINFO_MC_DESC / GET_INSTRINFO_NAMED_OPS /
+//        ENABLE_INSTR_PREDICATE_VERIFIER 引入 td 自动生成的 MCInstrInfo 部分.
+//   推荐阅读顺序: 文件底部 LLVMInitializeRISCV* 函数 -> 每个 Register* 调用 ->
+//      对应子模块的实现文件. 这是理解"LLVM 后端如何被驱动"的最佳入口.
+//   所有 NT 注释均以 "// <NT>" 开头, 方便搜索定位.
+
 #include "RISCVMCTargetDesc.h"
 #include "RISCVELFStreamer.h"
 #include "RISCVInstPrinter.h"

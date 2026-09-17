@@ -11,6 +11,57 @@
 //
 //===----------------------------------------------------------------------===//
 
+// <NT> 文件简介:
+//   RISCVAsmPrinter.cpp 实现 AsmPrinter 子类, 把 MachineFunction + MachineInstr
+//   降级为 MCStreamer 上的 MCInst / 汇编文本 / ELF 段元数据. 上游 LLVM 通用
+//   AsmPrinter 框架 + LLVM 通用 RegAlloc 之后的 MachineFunction; 下游
+//   MCTargetDesc 层 (RISCVMCInst / RISCVELFStreamer / RISCVAsmBackend /
+//   RISCVELFObjectWriter / RISCVTargetStreamer). 是 CodeGen → MC 的桥接层,
+//   同时是 RISC-V 专属 ELF 输出 (.riscv.attributes / .note.gnu.property /
+//   .variant_cc / .option arch) 的唯一发射点.
+//
+// <NT> 关键函数串联 (单条指令 / 单个函数的 emit 主流程):
+//   Module 级别:
+//     emitStartOfAsmFile           模块开头: ABI / ISA / .attribute 初始化
+//     ├─ emitAttributes          把 Subtarget 翻译成 ELF .RISCV.attributes
+//     ├─ HWASAN 初始化           为 HWASAN 标志做准备
+//     └─ 读 llvm.riscv-isa MDNode  更新 Subtarget 特性 (用于函数级 .option push)
+//     runOnMachineFunction         每个 MF 入口 (per-function 驱动)
+//     ├─ emitTargetFeaturePush   必要时 push .option arch
+//     ├─ SetupMachineFunction    通用 AsmPrinter 框架
+//     ├─ emitFunctionBody        遍历每条 MI 调 emitInstruction
+//     ├─ emitXRayTable           XRay patchable 站点表
+//     └─ emitTargetFeaturePop    与 push 对称地 pop
+//     emitEndOfAsmFile             模块收尾: close attributes / emitNoteGnuProperty / HWASAN 符号
+//   MI 级别 (核心循环):
+//     emitInstruction             每条 MI 的总入口 (本文件最热的函数)
+//     ├─ verifyInstructionPredicates  断言: 当前 Subtarget 是否允许此 opcode
+//     ├─ emitNTLHint              若 MI 带 NTL mem 属性, 插入 HINT 编码
+//     ├─ MI->MCInst 转换         lowerToMCInst / 伪指令 lowering
+//     ├─ 特殊指令: STACKMAP / PATCHPOINT / STATEPOINT / KCFI / HWASAN /
+//     │            PATCHABLE_* / CFI / LPAD-aligned call / returns_twice
+//     └─ OutStreamer->emitInstruction  最终把 MCInst 推给 MCStreamer
+//   其它 emit 入口:
+//     emitFunctionEntryLabel       函数标号 + variant_cc 标记 (vector-call ABI)
+//     emitMachineConstantPoolValue 长 PC 相对寻址的常量池条目
+//     LowerSTACKMAP/PATCHPOINT/STATEPOINT   StackMap 落地
+//     LowerHWASAN_CHECK_MEMACCESS / LowerKCFI_CHECK  内存安全 pseudo lowering
+//     emitNTLHint                   非临时访存提示 (X2..X5 编码)
+//     PrintAsmOperand / PrintAsmMemoryOperand  内联汇编操作数打印
+//
+// <NT> 总结:
+//   本文件是 RISC-V 后端 CodeGen → MC 的总出口. 三大职责:
+//     1) MI → MC 转换: 把 MachineInstr 通过 lowerToMCInst / 各种 Lower* 钩子
+//        转成 MCInst (含伪指令展开 + RVV 快速路径), 推给 MCStreamer.
+//     2) ELF 元数据: 发出 .riscv.attributes / .note.gnu.property /
+//        .variant_cc 等 RISC-V 专属段, 与 GNU as 输出兼容.
+//     3) 调试/安全: STACKMAP / PATCHPOINT / STATEPOINT / HWASAN / KCFI /
+//        XRay / NTL hint 等特殊指令的落地, 满足 sanitizer / debugger /
+//        linker relaxation 需求.
+//   推荐阅读顺序: runOnMachineFunction -> emitInstruction -> emitStartOfAsmFile ->
+//      emitEndOfAsmFile -> lowerToMCInst. 这条线走通后, 再去看
+//      LowerSTACKMAP / emitNTLHint / PrintAsmOperand 等分支细节.
+//   所有 NT 注释均以 "// <NT>" 开头, 方便搜索定位.
 #include "RISCVAsmPrinter.h"
 #include "MCTargetDesc/RISCVBaseInfo.h"
 #include "MCTargetDesc/RISCVELFStreamer.h"
@@ -289,6 +340,17 @@ bool RISCVAsmPrinter::EmitToStreamer(MCStreamer &S, const MCInst &Inst,
 // following LPAD is 4-byte aligned. For assembly output, wrap with
 // .option push/exact/pop to prevent relaxation. For object output,
 // emit the pseudo directly so MCCodeEmitter handles it without R_RISCV_RELAX.
+
+// <NT> Zicfilp 对齐 call 发射:
+//   emitLpadAlignedCall 处理 returns_twice 调用 (如 setjmp / vfork / Lua
+//   yield 等). Zicfilp (landing pad) 要求 LPAD 必须 4 字节对齐; 当启用 Zca
+//   (RVC 压缩) 时函数入口可能 2 字节对齐, 需要在 call 之前插 .p2align 2.
+//   关键机制: 汇编输出走 .option push/exact/pop 关闭 relaxation, 让汇编器
+//   不要把 call 后的 LPAD 跨边界合并; 对象输出走 pseudo 形式, 由
+//   RISCVMCCodeEmitter 写 R_RISCV_RELAX 让 AsmBackend 在 fixup 阶段处理.
+//   上游: emitInstruction 在识别到 returns_twice call 时调用; 下游:
+//   OutStreamer + RISCVMCCodeEmitter. 失败模式: Zca 关闭时不需要 align, 直接
+//   走 emitCall 即可; 没正确 emit .p2align 会导致运行时 LPAD misaligned trap.
 void RISCVAsmPrinter::emitLpadAlignedCall(const MachineInstr &MI) {
   const MCSubtargetInfo &MCSTI = getSubtargetInfo();
   const bool IsIndirect = MI.getOpcode() == RISCV::PseudoCALLIndirectLpadAlign,
@@ -355,6 +417,17 @@ void RISCVAsmPrinter::emitLpadAlignedCall(const MachineInstr &MI) {
 // instruction before it. NTL hints are always safe to emit since they use
 // HINT encodings that are guaranteed not to trap
 // (riscv-non-isa/riscv-elf-psabi-doc#474).
+
+// <NT> 非临时访存 HINT 编码:
+//   emitNTLHint 处理 IR 层标记的 __builtin_nontemporal_* 访存. RISC-V 没有
+//   专用 NTL 指令, 把 4 种 NTL 模式 (NONE / ALLOC / WRITE_THROUGH / WRITE_BACK)
+//   编码成 5 位的 HINT 立即数塞进 C.ADD / ADD rd, rs, hint 的 funct3 字段.
+//   关键机制: HINT 指令 (funct7=0, rs2=x0) 保证不 trap, 因此即使目标 CPU
+//   不识别也只会被忽略, 完全安全. 上游: emitInstruction 在每条访存 MI 前
+//   调用, 检查是否有 NonTemporal MachineMemOperand; 下游: MCStreamer 接收
+//   HINT MCInst, 经 RISCVMCCodeEmitter 编码为 32 位字. 失败模式: 编译器错误
+//   把 NTL 标在了写 / 读不一致的访问上, 会让数据缓存行为错误, 排查时检查
+//   MI.getMemOperands() 的 NonTemporal 标记位.
 void RISCVAsmPrinter::emitNTLHint(const MachineInstr *MI) {
   if (!STI->getInstrInfo()->requiresNTLHint(*MI))
     return;
@@ -384,6 +457,19 @@ void RISCVAsmPrinter::emitNTLHint(const MachineInstr *MI) {
   EmitToStreamer(*OutStreamer, Hint);
 }
 
+// <NT> MI emit 分派中心 (每条 MachineInstr 的总入口):
+//   emitInstruction 是本文件最热的函数, LLVM 后端每条 MachineFunction 的每条
+//   MI 都会过这里一次. 关键机制: 先用 td 生成的 verifyInstructionPredicates
+//   断言 MI 的 opcode 与当前 Subtarget 兼容 (调试期; Release 不开), 再按需
+//   插入 NTL HINT, 最后根据 MI 类型分派:
+//     1) 伪指令 (Pseudo) -> 走 Lower* 钩子 (STACKMAP / PATCHPOINT /
+//        STATEPOINT / HWASAN / KCFI / PATCHABLE_* / LPAD-aligned call) 或
+//        OutStreamer->emitInstruction 默认路径 (lowerToMCInst 自动生成).
+//     2) CFI 指令 -> 直接 emit.
+//     3) 真实指令 -> emitToCompressedInst -> OutStreamer->emitInstruction.
+//   上游: AsmPrinter::emitFunctionBody 的指令循环; 下游: OutStreamer ->
+//   RISCVMCCodeEmitter -> RISCVAsmBackend. 失败模式: 添加新指令后忘记写
+//   Predicates, Predicate 断言会先于此函数失败, 提示你补 td 的 Predicate 字段.
 void RISCVAsmPrinter::emitInstruction(const MachineInstr *MI) {
   RISCV_MC::verifyInstructionPredicates(MI->getOpcode(), STI->getFeatureBits());
 
@@ -447,6 +533,17 @@ void RISCVAsmPrinter::emitInstruction(const MachineInstr *MI) {
   EmitToStreamer(*OutStreamer, OutInst);
 }
 
+// <NT> inline asm 操作数打印:
+//   PrintAsmOperand 是 inline asm 操作数的 RISC-V 专属打印入口. 关键机制:
+//   在通用 AsmPrinter 框架之前先处理三个 RISC-V 专属修饰符:
+//     z  -> 零寄存器 (x0)         (用于 cmp $0, $1 之类的内联汇编)
+//     i  -> 立即数                  (Imm 强制, 不走寄存器)
+//     N  -> 寄存器编码号 (1..31)    (用于 mfgid 之类的系统指令)
+//   其它修饰符直接走父类 AsmPrinter::PrintAsmOperand.
+//   上游: AsmPrinter 在处理 InlineAsm 的每个 MCInlineAsmOperand 时调用;
+//   下游: raw_ostream 直接写到 .s 文件 (或 MCStreamer buffer). 失败模式:
+//   内联汇编里写 "li $0, 1" 而不是 "li x0, 1" 会被打印成 "li r0, 1" 导致
+//   GAS 报错; 此时检查是否需要新增修饰符.
 bool RISCVAsmPrinter::PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,
                                       const char *ExtraCode, raw_ostream &OS) {
   // First try the generic code, which knows about modifiers like 'c' and 'n'.
@@ -574,6 +671,18 @@ void RISCVAsmPrinter::emitTargetFeaturePop(const MCSubtargetInfo &STI,
     getTargetStreamer().emitDirectiveOptionPop();
 }
 
+// <NT> 每个 MachineFunction 的入口驱动:
+//   runOnMachineFunction 是每个 MachineFunction 必经的入口, 串起整个
+//   per-function 打印流程. 关键机制:
+//     1) STI 指向本 MF 的 Subtarget (per-function 特性, 由函数属性覆盖).
+//     2) emitTargetFeaturePush 必要时写 .option push / .option arch, 让本函数
+//        的指令编码按 Subtarget 跑; emitTargetFeaturePop 在结尾对称 pop.
+//     3) SetupMachineFunction 是通用 AsmPrinter 框架 (frame info / CFI 等).
+//     4) emitFunctionBody 是 LLVM 通用指令循环, 每条 MI -> emitInstruction.
+//     5) emitXRayTable 写本 MF 的 XRay patchable 站点表 (供运行时插桩).
+//   上游: AsmPrinter::runOnMachineFunction; 下游: emitInstruction / 通用框架.
+//   失败模式: 没正确配 STI 会让函数级 .option 写到错误的 ISA 字符串; 检查
+//   emitTargetFeaturePush 是否在 emitFunctionBody 之前调.
 bool RISCVAsmPrinter::runOnMachineFunction(MachineFunction &MF) {
   STI = &MF.getSubtarget<RISCVSubtarget>();
 
@@ -642,6 +751,18 @@ void RISCVAsmPrinter::emitSled(const MachineInstr *MI, SledKind Kind) {
   recordSled(CurSled, *MI, Kind, 2);
 }
 
+// <NT> 模块开头钩子 (.s 文件级):
+//   emitStartOfAsmFile 是模块级 .s 文件的开头钩子. 关键机制:
+//     1) 校验 TargetStreamer 已注入 (RISCVTargetELFStreamer 或 Darwin 版),
+//        否则 ABI / ISA 信息无法落地.
+//     2) emitAttributes 转发给 RISCVTargetStreamer, 把 Subtarget 翻译为
+//        ELF .RISCV.attributes 段条目 (ABI / 原子 / FP ABI 等).
+//     3) 读 Module 的 llvm.riscv-isa MDNode (用于 LTO 等场景下让函数级
+//        特性覆盖模块级 Subtarget), 调用 Subtarget 的 updateFeatureBits.
+//   上游: AsmPrinter::doInitialization / AsmPrinter::OutStreamer 初始化;
+//   下游: RISCVTargetStreamer / RISCVSubtarget. 失败模式: Module 含非法
+//   ISA 字符串会抛 "Unsupported feature"; 检查 RISC-V Subtarget 是否在
+//   RISCVFeatures::parseFeatureBits 中已加对应关键字.
 void RISCVAsmPrinter::emitStartOfAsmFile(Module &M) {
   assert(OutStreamer->getTargetStreamer() &&
          "target streamer is uninitialized");
@@ -677,6 +798,18 @@ void RISCVAsmPrinter::emitStartOfAsmFile(Module &M) {
     emitAttributes(SubtargetInfo);
 }
 
+// <NT> 模块收尾钩子 (.s 文件级):
+//   emitEndOfAsmFile 是模块级 .s 文件的收尾钩子. 关键机制:
+//     1) RTS.finishAttributeSection 把累积的 .riscv.attributes 写入 ELF 段
+//        (在 ELF 模式下, Mach-O 跳过此步).
+//     2) emitNoteGnuProperty 写 .note.gnu.property 段, 声明 CFI 方案
+//        (Zicfiss shadow stack / Zicfilp LPAD), 让运行时和链接器能识别.
+//     3) EmitHwasanMemaccessSymbols 写每个 HWASAN 函数的 __hwasan_check_*
+//        影子符号, 让 sanitizer runtime 在 LTO 后仍能解析对应 helper.
+//   上游: AsmPrinter::doFinalization; 下游: RISCVTargetStreamer /
+//   MCStreamer (落盘 .riscv.attributes / .note.gnu.property / 符号表).
+//   失败模式: ELF flag 错误 (没识别出 ELF triple) 会让 finishAttributeSection
+//   走空, .riscv.attributes 段缺失, GCC 链接器不识别; 检查 TM.getTargetTriple().
 void RISCVAsmPrinter::emitEndOfAsmFile(Module &M) {
   RISCVTargetStreamer &RTS = getTargetStreamer();
 
@@ -1306,6 +1439,20 @@ static bool lowerRISCVVMachineInstrToMCInst(const MachineInstr *MI,
   return true;
 }
 
+// <NT> MI → MCInst 默认 lowering 路径:
+//   lowerToMCInst 是 MI -> MCInst 的"普通路径". 关键机制:
+//     1) 先尝试 RVV 向量快速路径: lowerRISCVVMachineInstrToMCInst, 把 RVV
+//        pseudos (带 AVL/SEW/LMUL/TA/MA) 折叠到 32/48 位真实指令, 避免
+//        在普通路径里逐 MO 转换.
+//     2) 快速路径不命中则 setOpcode + 逐 MO 调用 lowerOperand: 把
+//        MachineOperand (Reg / Imm / Global / Block / JumpTable / CPI) 转成
+//        MCOperand. 符号类操作数走 lowerSymbolOperand, 根据 modifier (如
+//        CALL_PLT / GOT) 选 RISCV::Specifier, 让 AsmBackend 生成正确的
+//        R_RISCV_* 重定位.
+//   上游: AsmPrinter::emitInstruction 的默认分支 / OutStreamer->emitInstruction;
+//   下游: RISCVMCCodeEmitter 接收 OutMI. 失败模式: 新加的 GlobalAddress
+//   modifier 没在 lowerSymbolOperand 注册, 会退化成普通符号引用, 让
+//   链接阶段无法解析.
 void RISCVAsmPrinter::lowerToMCInst(const MachineInstr *MI, MCInst &OutMI) {
   if (lowerRISCVVMachineInstrToMCInst(MI, OutMI, STI))
     return;

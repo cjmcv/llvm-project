@@ -1585,7 +1585,6 @@ unsigned RISCVAsmParser::validateTargetOperandClass(MCParsedAsmOperand &AsmOp,
   return Match_InvalidOperand;
 }
 
-// <NT> 生成"立即数超出指令编码位数范围"诊断: 解析器在立即数操作数通过语法、但落在指令字段所不允许的范围时调用 (例如 SLLI shamt 只有 6 位, 却给出 64).
 bool RISCVAsmParser::generateImmOutOfRangeError(
     SMLoc ErrorLoc, int64_t Lower, int64_t Upper,
     const Twine &Msg = "immediate must be an integer in the range") {
@@ -1823,7 +1822,6 @@ std::string RISCVAsmParser::getCustomOperandDiag(unsigned MatchError) {
 // Process the list of near-misses, throwing away ones we don't want to report
 // to the user, and converting the rest to a source location and string that
 // should be reported.
-// <NT> "接近命中"过滤: 对 MatchInstructionImpl 收集的近候选指令 (助记符相似、操作数兼容但不完全匹配) 做去重与排序, 提炼成最值得提示给用户的若干条, 供 ReportNearMisses 输出.
 void RISCVAsmParser::FilterNearMisses(
     SmallVectorImpl<NearMissInfo> &NearMissesIn,
     SmallVectorImpl<NearMissMessage> &NearMissesOut, SMLoc IDLoc,
@@ -1926,7 +1924,6 @@ void RISCVAsmParser::FilterNearMisses(
   }
 }
 
-// <NT> 报告近命中诊断: 把 FilterNearMisses 提炼出的近候选以错误/附注形式打印; 0 条 -> "invalid instruction", 1 条 -> 直接报错, 多条 -> 报错并附 note.
 void RISCVAsmParser::ReportNearMisses(SmallVectorImpl<NearMissInfo> &NearMisses,
                                       SMLoc IDLoc, OperandVector &Operands) {
   SmallVector<NearMissMessage, 4> Messages;
@@ -1949,7 +1946,19 @@ void RISCVAsmParser::ReportNearMisses(SmallVectorImpl<NearMissInfo> &NearMisses,
   }
 }
 
-// <NT> 汇编解析器的主入口: 每解析完一条指令的操作数都会被调用, 调用 TableGen 生成的 MatchInstructionImpl 走自动匹配, 成功 -> validateInstruction -> processInstruction, 助记符失败 -> 拼写检查, 候选失败 -> 报告近命中.
+// <NT> 汇编解析器主入口 (MatchInstructionImpl 调用方):
+//   调用链: parseInstruction -> matchAndEmitInstruction.
+//   接收 MCParser 已经 tokenize + 解析完的 Operands (含助记符 + 操作数),
+//   调用 TableGen 生成的 MatchInstructionImpl 走自动匹配.
+//   关键机制: 三种 Match_ 结果分支处理 --
+//     1) Match_Success: 调 validateInstruction 做谓词/VTYPE 检查,
+//        通过后调 processInstruction 走伪指令展开调度;
+//     2) Match_MnemonicFail: 助记符不认识, 走 RISCVMnemonicSpellCheck
+//        拼写检查 (LD-like 距离) 给出建议;
+//     3) Match_NearMisses: 候选命中但操作数不兼容, 调 ReportNearMisses
+//        列出可能的相近指令.
+//   上下游: 上游 MCParser, 下游 validateInstruction / processInstruction.
+//   注意: 本函数不直接调 emit, 发射是 processInstruction 通过 emitToStreamer 完成.
 bool RISCVAsmParser::matchAndEmitInstruction(SMLoc IDLoc, unsigned &Opcode,
                                              OperandVector &Operands,
                                              MCStreamer &Out,
@@ -1985,7 +1994,6 @@ bool RISCVAsmParser::matchAndEmitInstruction(SMLoc IDLoc, unsigned &Opcode,
 // alternative ABI names), returning the matching register. Upon failure,
 // returns a non-valid MCRegister. If IsRVE, then registers x16-x31 will be
 // rejected.
-// <NT> 寄存器名解析助手: 先按 TableGen 默认名匹配, 失败再走 ABI 别名 (如 sp/gp/tp/ra 等); 同时拒绝 RV32E 模式下 x16-x31 的访问, 并保证返回的 FPR 是 D 类 (64 位) 而非 H/F/Q 子寄存器.
 MCRegister RISCVAsmParser::matchRegisterNameHelper(StringRef Name) const {
   MCRegister Reg = MatchRegisterName(Name);
   // The 16-/32-/128- and 64-bit FPRs have the same asm name. Check
@@ -2005,7 +2013,15 @@ MCRegister RISCVAsmParser::matchRegisterNameHelper(StringRef Name) const {
   return Reg;
 }
 
-// <NT> 通用寄存器解析入口: 根据指令助记符要求 (GP/FPR/VEC/VR/VS 等) 分派到不同的子解析器, 同时识别符号表达式形式 (如 %pc) 并把符号寄存器标记为可重定位.
+// <NT> 通用寄存器解析入口 (parseOperand 分派目标之一):
+//   调用链: parseOperand -> parseRegister (按指令要求分派).
+//   根据指令助记符要求的寄存器类 (GP / FPR / VEC / VR / VS / MaskReg),
+//   把 token 流分派到不同子解析器: 纯 GPR 走 MatchRegisterName /
+//   MatchRegisterAltName, 浮点 / 向量走各自 RegisterClass 特化解析.
+//   关键机制: 同时识别符号表达式形式的寄存器 (如 %pc), 把符号寄存器
+//   标记为可重定位, 让 linker relaxation 能正确处理 PC-相对引用.
+//   上下游: 上游 parseOperand, 下游 MCStreamer 通过 MCInst 收到.
+//   失败模式: 寄存器名不在任何已知类中 -> 返回 false + 报错.
 bool RISCVAsmParser::parseRegister(MCRegister &Reg, SMLoc &StartLoc,
                                    SMLoc &EndLoc) {
   if (!tryParseRegister(Reg, StartLoc, EndLoc).isSuccess())
@@ -2401,7 +2417,16 @@ ParseStatus RISCVAsmParser::parseOperandWithSpecifier(OperandVector &Operands) {
   return Failed;
 }
 
-// <NT> 解析带 % 前缀说明符的表达式: 支持 %lo/%hi/%pcrel_hi/%tls_ie/%tls_gd/%tprel_lo/%tprel_hi 等 RISC-V 特有重定位修饰符, 把它们记录到 MCExpr 子类中, 供后续 MCCodeEmitter 生成对应 R_RISCV_* 重定位.
+// <NT> 解析带 % 前缀说明符的 RISC-V 表达式:
+//   调用链: parseOperand / parseDataExpr -> parseExprWithSpecifier.
+//   支持 RISC-V 特有的重定位修饰符: %lo / %hi (高低 20+12 位),
+//   %pcrel_hi (PC 相对高 20 位, linker relax 用), %tls_ie / %tls_gd
+//   (TLS 初始执行 / 全局动态模型), %tprel_lo / %tprel_hi (TLS 线程局部偏移).
+//   关键机制: 把修饰符记录到 MCExpr 子类 (RVPCRelHiExpr / RVTPRelAddExpr /
+//   RVImmCompatAddExpr 等), 后续 MCCodeEmitter 根据 Expr 类型生成对应
+//   R_RISCV_* 重定位条目.
+//   上下游: 上游 parseOperand / parseDataExpr, 下游 MCCodeEmitter.
+//   注意: 调用前必须已 lex 过 %, 否则报错.
 bool RISCVAsmParser::parseExprWithSpecifier(const MCExpr *&Res, SMLoc &E) {
   SMLoc Loc = getLoc();
   if (getLexer().getKind() != AsmToken::Identifier)
@@ -2423,7 +2448,6 @@ bool RISCVAsmParser::parseExprWithSpecifier(const MCExpr *&Res, SMLoc &E) {
   return false;
 }
 
-// <NT> 解析 .word/.dword 等数据伪指令里的表达式: 完整地处理带 % 说明符的常量表达式, 然后把内部 RVPCRelHiExpr / RVTPRelAddExpr 等转成符号 + 偏移的形式, 以便最终落到 R_RISCV_* 重定位.
 bool RISCVAsmParser::parseDataExpr(const MCExpr *&Res) {
   SMLoc E;
   if (parseOptionalToken(AsmToken::Percent))
@@ -2554,7 +2578,16 @@ ParseStatus RISCVAsmParser::parseJALOffset(OperandVector &Operands) {
   return parseExpression(Operands);
 }
 
-// <NT> 解析 RVV 向量 vtype 即时值: 接受 e.g. `e32, m1, ta, ma` 这种简写, 转换为标准的 SEW/LMUL/TA/MA 字段值, 同时校验组合合法性; 后续 processInstruction 会把它写进 VTYPE 的二进制编码.
+// <NT> 解析 RVV 向量 vtype 即时值 (vsetvli / vsetivli 专用):
+//   调用链: parseOperand -> parseVTypeToken (仅在助记符是 vsetvli /
+//   vsetivli 时). 接受 e.g. `e32, m1, ta, ma` 这种人类可读简写, 转换
+//   为标准的 SEW (8/16/32/64) / LMUL (m1/m2/m4/m8/f2/f4/f8) / TA
+//   (tu/top-agnostic) / MA (mu/mask-agnostic) 四个字段值, 同时校验
+//   组合合法性 (如 e32 不能配 m8).
+//   关键机制: 状态机解析, 每次 token 进入切到下一个状态 (SEW -> LMUL
+//   -> TA -> MA), 全集齐后写到 VTypeState 结构, 后续 processInstruction
+//   把它写入 VTYPE 的二进制编码 (zimm[9:0]).
+//   上下游: 上游 parseOperand, 下游 processInstruction (拼装 VTYPE).
 bool RISCVAsmParser::parseVTypeToken(const AsmToken &Tok, VTypeState &State,
                                      unsigned &Sew, unsigned &Lmul,
                                      bool &Fractional, bool &TailAgnostic,
@@ -3263,7 +3296,6 @@ ParseStatus RISCVAsmParser::parseZcmpStackAdj(OperandVector &Operands,
 /// Looks at a token type and creates the relevant operand from this
 /// information, adding to Operands. If operand was parsed, returns false, else
 /// true.
-// <NT> 单条操作数解析: 根据已读到的助记符和指令格式提示, 分派到 register / immediate / memory / vtype 等子解析器; 失败会产出带位置的诊断信息并通过 NearMissInfo 供后续错误报告使用.
 bool RISCVAsmParser::parseOperand(OperandVector &Operands, StringRef Mnemonic) {
   // Check if the current operand has a custom associated parser, if so, try to
   // custom parse the operand, or fallback to the general approach.
@@ -3291,7 +3323,16 @@ bool RISCVAsmParser::parseOperand(OperandVector &Operands, StringRef Mnemonic) {
   return true;
 }
 
-// <NT> 单条汇编指令解析的主循环: 识别 label, 处理 .insn / .variant_cc 等伪指令, 收集操作数到 Operands, 最后调用 matchAndEmitInstruction 走匹配/编码/输出流程; 是整个 AsmParser 唯一对外的 parseInstruction 实现.
+// <NT> 解析器唯一对外的 parseInstruction 实现 (顶层入口):
+//   调用方: MCParser 基类 parseStatement -> 本函数. 是整个
+//   RISCVAsmParser 与 MCParser 框架衔接的唯一接口, 每一行汇编都会被
+//   调一次. 关键机制: 识别三种 line head --
+//     1) label: 以 : 结尾, 走 emitLabel, 直接 return.
+//     2) .insn / .variant_cc: 走 parseDirectiveInsn / parseDirectiveVariantCC.
+//     3) 普通指令: 收集操作数到 Operands, 调 matchAndEmitInstruction 走匹配流程.
+//   上下游: 上游 MCParser, 下游 matchAndEmitInstruction / parseDirectiveInsn
+//   / emitLabel. 注意: 本函数不直接调 emit, 一切发射都通过
+//   matchAndEmitInstruction -> processInstruction -> emitToStreamer 链路.
 bool RISCVAsmParser::parseInstruction(ParseInstructionInfo &Info,
                                       StringRef Name, SMLoc NameLoc,
                                       OperandVector &Operands) {
@@ -3329,7 +3370,6 @@ bool RISCVAsmParser::parseInstruction(ParseInstructionInfo &Info,
   return false;
 }
 
-// <NT> 分类 MCExpr 是否能简化为对单一符号的引用: 当一个带 %lo/%hi 的表达式最终能表示成 "符号 + 常量偏移" 时, MCCodeEmitter 可以选择生成 R_RISCV_RELAX 等待链接器 relax, 而不是预先算地址; 是 RISC-V linker relaxation 优化的关键入口.
 bool RISCVAsmParser::classifySymbolRef(const MCExpr *Expr,
                                        RISCV::Specifier &Kind) {
   Kind = RISCV::S_None;
@@ -3344,7 +3384,6 @@ bool RISCVAsmParser::classifySymbolRef(const MCExpr *Expr,
   return false;
 }
 
-// <NT> 判断 MCExpr 是否为两个符号的差 (a - b), 用于生成 R_RISCV_ADD/SUB 等需要符号差的特殊重定位场景; 与 classifySymbolRef 配合, 共同决定 relax 时如何收缩指令序列.
 bool RISCVAsmParser::isSymbolDiff(const MCExpr *Expr) {
   MCValue Res;
   if (Expr->evaluateAsRelocatable(Res, nullptr)) {
@@ -3369,7 +3408,6 @@ ParseStatus RISCVAsmParser::parseDirective(AsmToken DirectiveID) {
   return ParseStatus::NoMatch;
 }
 
-// <NT> 实现 `.option arch` 指令: 在汇编中切换 RISC-V 目标架构字符串 (例如 `-march=rv64imac` -> `-march=rv64imafdc`), 重置 Subtarget 的 Feature 位; 用 std::string Result 回填新的指令字符串供下次解析.
 bool RISCVAsmParser::resetToArch(StringRef Arch, SMLoc Loc, std::string &Result,
                                  bool FromOptionDirective) {
   const auto &AllFeatures = getSTI().getAllProcessorFeatures();
@@ -3414,7 +3452,6 @@ bool RISCVAsmParser::resetToArch(StringRef Arch, SMLoc Loc, std::string &Result,
   return false;
 }
 
-// <NT> 解析 `.option` 指令族: 支持 arch / rvc / norvc / push / pop / relax / norelax 等子命令, 转发到对应的 resetToArch / setFeatureBits / relaxation 开关; 汇编代码里用这个来切换编译选项.
 bool RISCVAsmParser::parseDirectiveOption() {
   MCAsmParser &Parser = getParser();
   // Get the option token.
@@ -3632,7 +3669,6 @@ bool RISCVAsmParser::parseDirectiveOption() {
 /// parseDirectiveAttribute
 ///  ::= .attribute expression ',' ( expression | "string" )
 ///  ::= .attribute identifier ',' ( expression | "string" )
-// <NT> 解析 `.attribute` 指令: 支持 Tag 4 (architecture)、Tag 5 (unaligned access)、Tag 6 (stack alignment)、Tag 16 (Tag_RISCV_arch) 等 ELF ABI 属性, 把它们写入 RISCVTargetStreamer 以便最终嵌入 .riscv.attributes 段.
 bool RISCVAsmParser::parseDirectiveAttribute() {
   MCAsmParser &Parser = getParser();
   int64_t Tag;
@@ -3727,7 +3763,6 @@ bool isValidInsnFormat(StringRef Format, const MCSubtargetInfo &STI) {
 /// ::= .insn [ format encoding, (operands (, operands)*) ]
 /// ::= .insn [ length, value ]
 /// ::= .insn [ value ]
-// <NT> 解析 `.insn` 指令: 允许汇编中按 RISC-V 指令格式 (R/I/S/B/U/J) 直接给出 funct12 等底层字段, 生成等价指令; 是手写伪指令或与 GCC as 互操作时绕开助记符匹配的关键路径.
 bool RISCVAsmParser::parseDirectiveInsn(SMLoc L) {
   MCAsmParser &Parser = getParser();
 
@@ -3839,7 +3874,6 @@ bool RISCVAsmParser::parseDirectiveVariantCC() {
   return false;
 }
 
-// <NT> 单条 MCInst 出口: 把最终合法指令交给 MCStreamer; 它会在这一层加 .loc debug 行号、把 vset{i}vli 折叠到 RISCVInsertVSETVLI、记录 source line 等, 是 AsmParser 和 Streamer 的衔接点.
 void RISCVAsmParser::emitToStreamer(MCStreamer &S, const MCInst &Inst) {
   MCInst CInst;
   bool Res = false;
@@ -3851,7 +3885,16 @@ void RISCVAsmParser::emitToStreamer(MCStreamer &S, const MCInst &Inst) {
   S.emitInstruction((Res ? CInst : Inst), STI);
 }
 
-// <NT> 立即数加载的统一入口: 给定目标寄存器和 64 位常数, 自动选择最短的 LUI/ADDI/SLLI 序列 (1-8 条指令); 拆分算法见 RISCVMatInt::splitImm, 这是 RV64 上 li 伪指令的最终落地.
+// <NT> 立即数加载的统一入口 (li 伪指令最终落地):
+//   调用链: processInstruction (处理 PseudoLI / PseudoLA 时) -> emitLoadImm.
+//   给定目标寄存器和 64 位常数, 自动选择最短的 LUI / ADDI / SLLI 序列
+//   (1-8 条指令). 关键机制: 拆分算法见 RISCVMatInt::splitImm, 它会构造
+//   12 位片段并搜索最优组合:
+//     - 1 条: 常数在 [-2048, 2047] 范围, 单条 addi
+//     - 2 条: 常数需要 LUI+ADDI
+//     - 最多 8 条: RV64 上需要多个 SLLI+ADDI 链组合
+//   上下游: 上游 processInstruction, 下游 MCStreamer (emit AuipcInstPair
+//   或单条 addi). 注意: 负数需要 12 位加立即数区间偏移, 算法里有 special-case.
 void RISCVAsmParser::emitLoadImm(MCRegister DestReg, int64_t Value,
                                  MCStreamer &Out) {
   SmallVector<MCInst, 8> Seq;
@@ -3862,7 +3905,6 @@ void RISCVAsmParser::emitLoadImm(MCRegister DestReg, int64_t Value,
   }
 }
 
-// <NT> 生成 AUIPC + ADDI 对: 用于 PC-相对地址的低 32 位 (%pcrel_lo); 链接器把这两条指令 relax 到 c.j / c.jal 时整段会缩成一条短跳转, 所以这里刻意写成 auipc+addi 而不是 LUI+ADDI.
 void RISCVAsmParser::emitAuipcInstPair(MCRegister DestReg, MCRegister TmpReg,
                                        const MCExpr *Symbol,
                                        RISCV::Specifier VKHi,
@@ -3889,7 +3931,6 @@ void RISCVAsmParser::emitAuipcInstPair(MCRegister DestReg, MCRegister TmpReg,
                           .addExpr(RefToLinkTmpLabel));
 }
 
-// <NT> 展开 la.tls.ie / 类似伪指令的本地地址加载: 解析 MCInst 里的符号和偏移, 调 emitLoadImm + emitAuipcInstPair 拼出 la rd, sym 的指令序列.
 void RISCVAsmParser::emitLoadLocalAddress(MCInst &Inst, SMLoc IDLoc,
                                           MCStreamer &Out) {
   // The load local address pseudo-instruction "lla" is used in PC-relative
@@ -3909,7 +3950,6 @@ void RISCVAsmParser::emitLoadLocalAddress(MCInst &Inst, SMLoc IDLoc,
                       IDLoc, Out);
 }
 
-// <NT> 展开全局符号地址加载: 根据目标 ABI 选 LUI+ADDI (绝对) 或 AUIPC+ADDI (PC-相对), 并附 R_RISCV_HI20 / R_RISCV_LO12_I / R_RISCV_PCREL_HI20 重定位; linker relaxation 时还能把 6 字节序列压成 c.j/c.jal.
 void RISCVAsmParser::emitLoadGlobalAddress(MCInst &Inst, SMLoc IDLoc,
                                            MCStreamer &Out) {
   // The load global address pseudo-instruction "lga" is used in GOT-indirect
@@ -3925,7 +3965,17 @@ void RISCVAsmParser::emitLoadGlobalAddress(MCInst &Inst, SMLoc IDLoc,
                     IDLoc, Out);
 }
 
-// <NT> 通用地址加载分派: 区分符号是 local (gp-relative) 还是 global, 再分别走 emitLoadLocalAddress / emitLoadGlobalAddress; 是 la 伪指令的统一入口.
+// <NT> 通用地址加载分派 (la 伪指令最终落地):
+//   调用链: processInstruction (处理 PseudoLA 时) -> emitLoadAddress.
+//   区分符号类型做分派: 是 local symbol (gp-relative) 走 emitLoadLocalAddress,
+//   是 global symbol 走 emitLoadGlobalAddress.
+//   关键机制: emitLoadGlobalAddress 内部根据目标 ABI 选 LUI+ADDI (绝对寻址,
+//   medlow) 或 AUIPC+ADDI (PC 相对寻址, medany), 同时附 R_RISCV_HI20 /
+//   R_RISCV_LO12_I / R_RISCV_PCREL_HI20 重定位.
+//   linker relaxation 优化: 6 字节 LUI+ADDI 序列在目标地址 < 2KB 范围内
+//   能被压成 c.j / c.jal 一条压缩跳转, 省 4 字节.
+//   上下游: 上游 processInstruction, 下游 emitLoadLocalAddress /
+//   emitLoadGlobalAddress -> emitLoadImm + emitAuipcInstPair.
 void RISCVAsmParser::emitLoadAddress(MCInst &Inst, SMLoc IDLoc,
                                      MCStreamer &Out) {
   // The load address pseudo-instruction "la" is used in PC-relative and
@@ -3941,7 +3991,6 @@ void RISCVAsmParser::emitLoadAddress(MCInst &Inst, SMLoc IDLoc,
     emitLoadLocalAddress(Inst, IDLoc, Out);
 }
 
-// <NT> TLS IE (Initial Exec) 模型地址加载: 在 ld 共享库后, 进程启动期通过 GOT 间接访问 TLS 变量; 展开为 lui + %tls_ie_add / addiw 对, 配 R_RISCV_TLS_IE_HI20 / R_RISCV_TLS_IE_LO12_I 重定位.
 void RISCVAsmParser::emitLoadTLSIEAddress(MCInst &Inst, SMLoc IDLoc,
                                           MCStreamer &Out) {
   // The load TLS IE address pseudo-instruction "la.tls.ie" is used in
@@ -3957,7 +4006,6 @@ void RISCVAsmParser::emitLoadTLSIEAddress(MCInst &Inst, SMLoc IDLoc,
                     SecondOpcode, IDLoc, Out);
 }
 
-// <NT> TLS GD (General Dynamic) 模型地址加载: 通过 __tls_get_addr 解析, 展开为 lui + %tls_gd_pcrel_hi / addiw 对; 用于多线程共享库的全局 TLS 变量访问.
 void RISCVAsmParser::emitLoadTLSGDAddress(MCInst &Inst, SMLoc IDLoc,
                                           MCStreamer &Out) {
   // The load TLS GD address pseudo-instruction "la.tls.gd" is used in
@@ -4083,7 +4131,18 @@ void RISCVAsmParser::emitQCELILoadStoreSymbol(MCInst &Inst, unsigned Opcode,
   }
 }
 
-// <NT> 展开 sext.b/h/w / zext.b/h/w 伪指令: 根据操作数宽度选 slli + srli/srai 或 slli + srli + addi, 把 8/16/32 位扩展到 XLEN; RISC-V 基础 ISA 没有原生 zero/sign extend, 因此靠移位合成.
+// <NT> 展开 sext.b / sext.h / sext.w / zext.b / zext.h / zext.w 伪指令:
+//   调用链: processInstruction (处理 PseudoSEXT_* / PseudoZEXT_* 时)
+//   -> emitPseudoExtend. RISC-V 基础 ISA 没有原生 zero/sign extend
+//   指令 (要等 Zbb 扩展才有), 因此靠移位合成:
+//     - sext.b (8->64): slli rd, rs, 56 + srai rd, rd, 56
+//     - zext.b (8->64): andi rd, rs, 0xff (1 条, 最便宜)
+//     - sext.h (16->64): slli 48 + srai 48
+//     - zext.h (16->64): slli 48 + srli 48
+//     - sext.w (32->64): slli 32 + srai 32 (RV32 上是 srai 但只取 32 位)
+//     - zext.w (32->64): slli 32 + srli 32
+//   上下游: 上游 processInstruction, 下游 MCStreamer. 注意: 调用前
+//   InstPrinter 端不会展开, 这里把 Inst 内容替换为多个真实指令再发射.
 void RISCVAsmParser::emitPseudoExtend(MCInst &Inst, bool SignExtend,
                                       int64_t Width, SMLoc IDLoc,
                                       MCStreamer &Out) {
@@ -4340,7 +4399,17 @@ static bool isZvvfmmScaleOpcode(unsigned Opcode) {
   }
 }
 
-// <NT> 指令合法性最终把关: 在 MCInst 已经匹配完成、即将发射前, 检查谓词 (Predicates) 和 VTYPE 一致性等; 通过后才会进入 processInstruction, 不通过则报 "instruction requires ..." 错误.
+// <NT> 指令合法性最终把关 (validateInstruction):
+//   调用链: matchAndEmitInstruction -> validateInstruction -> processInstruction.
+//   在 MCInst 已经匹配完成、即将发射前, 做最后一道合法性检查, 防止非法
+//   指令溜出去. 检查项:
+//     1) Subtarget Predicate (Predicates): 当前 target 是否启用了该指令
+//        所需扩展 (如 RVV 没开却用到向量指令 -> 拒绝);
+//     2) VTYPE 一致性: RVV 指令的 SEW/LMUL/TA/MA 字段是否与当前
+//        vsetvli 状态一致 (例如预期 SEW=32 但指令编码了 e64).
+//   失败模式: 不通过则报 "instruction requires ..." 错误并 return true
+//   (true 表示 matchAndEmitInstruction 走 Error 路径).
+//   上下游: 上游 matchAndEmitInstruction, 下游 processInstruction.
 bool RISCVAsmParser::validateInstruction(MCInst &Inst,
                                          OperandVector &Operands) {
   unsigned Opcode = Inst.getOpcode();
@@ -4517,7 +4586,19 @@ bool RISCVAsmParser::validateInstruction(MCInst &Inst,
   return false;
 }
 
-// <NT> 伪指令展开调度中心: 对所有需要展开为真实指令序列的伪指令 (la, li, call, tail, sext/zext, TLS 加载, VMSGE, j offset, 等) 做分派, 替换 Inst 内容并通过 emitToStreamer 送出, 是 AsmParser 把 MCInst 编译成最终机器码的关键环节.
+// <NT> 伪指令展开调度中心 (processInstruction):
+//   调用链: validateInstruction -> processInstruction -> emitToStreamer
+//   -> MCStreamer. 对所有需要展开为真实指令序列的伪指令做分派, 替换
+//   Inst 内容. 处理清单 (按出现频率):
+//     - la rd, sym: emitLoadAddress (local/global 分派)
+//     - li rd, imm: emitLoadImm (LUI+ADDI/SLLI 序列)
+//     - call offset: auipc + jalr
+//     - tail offset: auipc + jalr x0
+//     - sext.b/h/w / zext.b/h/w: emitPseudoExtend (移位合成)
+//     - la.tls.ie / la.tls.gd: emitLoadTLSIEAddress / GDAddress
+//     - VMSGE.* RVV 比较指令的 mask 形态拆分
+//   上下游: 上游 validateInstruction, 下游 emitToStreamer -> MCStreamer.
+//   注意: 本函数不返回 MCInst, 它直接把替换后的指令 emit 给 streamer.
 bool RISCVAsmParser::processInstruction(MCInst &Inst, SMLoc IDLoc,
                                         OperandVector &Operands,
                                         MCStreamer &Out) {

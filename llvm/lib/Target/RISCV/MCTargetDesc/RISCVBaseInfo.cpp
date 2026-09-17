@@ -11,6 +11,31 @@
 //
 //===----------------------------------------------------------------------===//
 
+// <NT> 文件简介:
+//   RISCVBaseInfo.cpp 是 RISC-V 后端的"全局查表与枚举辅助"层. 文件很短
+//   (≈350 行), 但被 AsmPrinter / Disassembler / ISelLowering / RISCVII 等
+//   多个核心模块广泛引用. 上游 RISCVSubtarget / 各 Pass, 下游不直接发指令,
+//   仅提供静态查表 / 枚举.
+//
+// <NT> 关键函数串联:
+//   运行时查询:
+//     RISCVArch::is64 / features             架构字符串解析与运行时检查
+//     RISCVII::isRVVRegClass                 判断 RegisterClass 是否属 RVV 向量
+//     RISCVII::hasV0Dmask / hasV0Tmask       RVV 掩码形式 (v0.t vs v0 全掩码)
+//   转换工具:
+//     FeatureBitset -> String / String -> FeatureBitset
+//     ABI 字符串 ("lp64" / "ilp32" / "ilp32e") 解析
+//   注: 本文件无主入口, 是一组 namespace-scope 工具函数 + 常量数组.
+//
+// <NT> 总结:
+//   本文件是 RISC-V 后端的"工具箱". 三大职责:
+//     1) 寄存器类判断: 区分标量 (GPR/FPR) / RVV 向量 / 厂商扩展的 RegisterClass.
+//     2) 架构 / ABI 字符串解析: 把 -march=rv64imafdc 等命令行参数转换成
+//        Subtarget 可消费的 FeatureBitset 与 ABI 标记.
+//     3) RVV 掩码 / 段式访存等特化查询: 给 ISel / Disassembler 提供
+//        "该指令是否走 v0.t 掩码"等细节判断.
+//   推荐阅读顺序: 搜 RISCVII:: / RISCVArch:: namespace, 按需跳读.
+//   所有 NT 注释均以 "// <NT>" 开头, 方便搜索定位.
 #include "RISCVBaseInfo.h"
 #include "RISCVMCAsmInfo.h"
 #include "llvm/MC/MCInst.h"

@@ -6,6 +6,39 @@
 //
 //===----------------------------------------------------------------------===//
 
+// <NT> 文件简介:
+//   RISCVMatInt.cpp 是 RV64 `li rd, <big-const>` 伪指令展开的核心算法.
+//   给定任意 64 位常数 + 目标寄存器, 搜索最短的 LUI / ADDI / SLLI / ADDI 指令
+//   序列 (1-8 条) 把常数加载到寄存器. 上游 RISCVAsmParser::emitLoadImm + Clang
+//   后端 RISCVISelLowering::LowerImmediate; 下游 MCStreamer 把生成的 MCInst
+//   序列 emit 到汇编流. 文件较大 (≈700 行) 是因为需要处理符号扩展 / 边界情况 /
+//   性能优化 (BFS 找最短路径).
+//
+// <NT> 关键函数串联 (li 展开主流程):
+//   入口:
+//     RISCVMatInt::generateInstSeq   工厂: 接收常量 + 寄存器, 返回 InstSeq
+//   拆解核心:
+//     RISCVMatInt::splitImm          把 64 位立即数拆成 [SHIFT, ADDI_VAL] 对,
+//         重复使用: 对每一对生成 SLLI + ADDI/SLLIU/ADDIW 指令.
+//         边界处理: 符号扩展 (32->64 位宽 / sign-extended imm12).
+//   性能优化:
+//     getInstSeqCost                  计算指令序列的最终字节数 (考虑 RVC 压缩)
+//         RVC 友好: 把每条 32 位指令折算成 1, 16 位折算成 0.5, 48 位折算 1.5.
+//         在 generateInstSeq 的 BFS 中选 cost 最小的拆分路径.
+//   注: 本文件无重对象创建, 全部是 static 算法 + 查表 (不要在调用栈上
+//      构造大容器, 是性能热点).
+//
+// <NT> 总结:
+//   本文件是 RV64 立即数加载的"伪指令反汇编器". 三大职责:
+//     1) 常数拆解: 把任意 64 位常量拆成 1-8 条 (SLLI + ADDI/SLLIU) 指令,
+//        让 RV64 的 12 位有符号 imm 限制不被打破.
+//     2) RVC 感知: 在 BFS 搜索时按可压缩指令降权, 输出能被 RVC 进一步压缩
+//        的最短序列, 减小代码体积.
+//     3) 边界正确性: 处理 RV32 sign-extension (ADDIW) / zero-extension /
+//        1<<63 等边界, 不让编译器产生错误结果.
+//   推荐阅读顺序: generateInstSeq -> splitImm -> getInstSeqCost. 这是理解
+//      "LLVM 后端如何用多条简单指令模拟复杂立即数"的标准案例.
+//   所有 NT 注释均以 "// <NT>" 开头, 方便搜索定位.
 #include "RISCVMatInt.h"
 #include "MCTargetDesc/RISCVMCTargetDesc.h"
 #include "llvm/ADT/APInt.h"

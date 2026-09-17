@@ -6,6 +6,37 @@
 //
 //===----------------------------------------------------------------------===//
 
+// <NT> 文件简介:
+//   RISCVMachObjectWriter.cpp 实现 Mach-O 对象文件写入器 (MCMachObjectWriter
+//   子类), 是 RISC-V 在 Apple/macOS 平台的 ELF 替代路径. 上游 MCAssembler,
+//   下游 ld64 / dyld. 与 RISCVELFObjectWriter.cpp 互斥, 由 Triple 选择
+//   ("riscv64-apple-..." -> Mach-O, 其它 -> ELF).
+//
+// <NT> 关键函数串联:
+//   工厂入口:
+//     createRISCVMachObjectWriter   注册到 TargetRegistry::RegisterMachOObjectWriter
+//   关键 override:
+//     getCPUType                    把 Subtarget 映射到 Mach-O CPU_TYPE_RISCV
+//                                    (含 riscv32 / riscv64 区分)
+//     getCPUSubType                 把 RVV/FP/位宽映射到 CPU_SUBTYPE_RISCV_ALL
+//                                    等, 让 dyld 在运行时正确路由.
+//   重定位支持:
+//     getRelocType                  把 RISCVFixupKinds 翻成 R_RISCV_* Mach-O
+//                                    重定位条目 (与 ELF 路径枚举相同但走 Mach-O 表).
+//
+//   注: 本文件调用频率低于 ELF 路径, 因为 RISC-V 在 Apple 平台仍属实验性
+//      支持. 大多数 RISC-V 工具链走 ELF 路径.
+//
+// <NT> 总结:
+//   本文件是 RISC-V Mach-O 输出层. 三大职责:
+//     1) Mach-O 标记: 把 RISC-V Subtarget 编码进 Mach-O header (CPU type /
+//        subtype), 让 macOS 工具链 (lldb / dyld / otool) 正确识别.
+//     2) 重定位类型映射: 与 ELF 路径对称, 但走 Mach-O 重定位表, 保证
+//        链接器能正确解析 %lo / %hi 等修饰符.
+//     3) 工厂注册: 把本实现通过 RegisterMachOObjectWriter 注入 TargetRegistry,
+//        配合 RISCVMCAsmInfoDarwin 让 RISC-V 工具链能在 macOS 上跑通.
+//   推荐阅读顺序: createRISCVMachObjectWriter -> getCPUType -> getRelocType.
+//   所有 NT 注释均以 "// <NT>" 开头, 方便搜索定位.
 #include "MCTargetDesc/RISCVFixupKinds.h"
 #include "MCTargetDesc/RISCVMCTargetDesc.h"
 #include "RISCVMCAsmInfo.h"

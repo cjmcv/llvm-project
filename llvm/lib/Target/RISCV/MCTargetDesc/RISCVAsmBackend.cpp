@@ -6,6 +6,33 @@
 //
 //===----------------------------------------------------------------------===//
 
+// <NT> 文件简介:
+//   RISCVAsmBackend.cpp 实现 MCAsmBackend 子类, 负责把 MCInst 编码为二进制
+//   指令字、处理 R_RISCV_* 重定位 (fixup)、执行 linker relaxation.
+//   上游 MCAssembler 在汇编输出二进制时调用本文件实现; 下游字节流写入
+//   ELF / Mach-O 对象文件. 是 RISC-V 汇编器输出可重定位对象文件的最后
+//   一道编码环节.
+//
+// <NT> 关键函数串联 (汇编输出主流程):
+//   RISCVAsmBackend                  基类 (公共 applyFixup / relaxInstruction / mayNeedRelaxation / writeNopData)
+//     ├─ ELFRISCVAsmBackend          Linux/ELF 后端 (主流路径)
+//     └─ DarwinRISCVAsmBackend       macOS/Mach-O 后端
+//   关键调用:
+//     MCAssembler -> applyFixup      把 R_RISCV_LO12_I 等重定位的 12/20 位字段写入指令字
+//                -> relaxInstruction  决定 LUI+ADDI 序列是否能压成 c.j / c.jal
+//                -> writeNopData      填充对齐 NOP (c.nop / c.nop.rvc / c.addi x0, 0)
+//   Fixup 种类 (按使用频率): R_RISCV_LO12_I / HI20 / PCREL_HI20 / CALL /
+//     CALL_PLT / ADD / SUB / JAL / BRANCH / RVC_BRANCH / RVC_JUMP 等.
+//
+// <NT> 总结:
+//   本文件是 RISC-V 汇编器后端. 三大职责:
+//     1) Fixup 应用: 把 R_RISCV_* 重定位对应的字段 (12 位有符号 / 20 位高位
+//        / 32 位 PC 相对偏移等) 正确写入指令字的对应位段.
+//     2) Linker relaxation: 决定一条指令是否可以在链接阶段收缩成更短
+//        形式 (如 6 字节 LUI+ADDI -> 2 字节 c.j / c.jal).
+//     3) NOP 填充与对齐: 在 .text 段对齐或 relax 间隙插入合法的 NOP 指令.
+//   推荐阅读顺序: RISCVAsmBackend (基类) -> ELFRISCVAsmBackend -> DarwinRISCVAsmBackend.
+//   所有 NT 注释均以 "// <NT>" 开头, 方便搜索定位.
 #include "RISCVAsmBackend.h"
 #include "RISCVFixupKinds.h"
 #include "llvm/ADT/APInt.h"

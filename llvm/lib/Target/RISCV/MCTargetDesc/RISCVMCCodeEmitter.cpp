@@ -10,6 +10,38 @@
 //
 //===----------------------------------------------------------------------===//
 
+// <NT> 文件简介:
+//   RISCVMCCodeEmitter.cpp 实现 MCCodeEmitter 子类, 把 MCInst 的每个操作数
+//   字段打包成 32/16/48 位指令字 (二进制编码). 上游 llc / clang -c /
+//   llvm-mc -filetype=obj / RISCVAsmPrinter; 下游 RISCVAsmBackend 接收编码
+//   结果做 fixup 与 relaxation. 是 AsmParser 反向流程的核心.
+//
+// <NT> 关键函数串联 (单条指令编码主流程):
+//   encodeInstruction             顶层入口, 按指令字长分派到
+//     ├─ encodeInstruction<32>    32 位主路径, 处理 RV32I/RV64I/CB/CJ
+//     └─ encodeInstruction<16>    16 位 RVC 压缩指令
+//   字段打包 (per-opcode TableGen-generated getMachineOpValue):
+//     getMachineOpValue            把单操作数编码成位段:
+//       ├─ RegOp (rd/rs1/rs2)     5 位 (RV32) 或 5/3 位 (RVC), 用 MCRegister 枚举
+//       ├─ ImmOp (imm12/shamt)    12 位有符号 / 5-6 位 shamt
+//       ├─ UImmOp (csr/zimm)      无符号立即数, 视字段宽度而定
+//       ├─ MemOp (基地址+偏移)    把 imm12 和 rs1 一起打包成 S/B/I-type 格式
+//       └─ VTypeOp                RVV zimm[9:0] 立即数 (vsetvli)
+//   Fixup 生成:
+//     getFixupKind                 把操作数翻译为 RISCV::*Fixup 枚举
+//     encodeInstruction 末尾       根据 Fixup 把对应字段写入指令字, 由
+//                                  RISCVAsmBackend 在 fixup 阶段补全最终值.
+//
+// <NT> 总结:
+//   本文件是 RISC-V 后端的二进制编码层. 三大职责:
+//     1) 字段打包: 把 MCInst 的每个操作数 (寄存器号 / 立即数 / 内存偏移 /
+//        vtype) 按指令格式位段 (R/I/S/B/U/J/RVC) 正确拼装到 32/16/48 位指令字.
+//     2) Fixup 生成: 标记哪些字段需要链接器补全 (R_RISCV_LO12_I 等),
+//        下游 RISCVAsmBackend 会按 Fixup 写重定位条目.
+//     3) 工厂注册: 通过 createRISCVMCCodeEmitter 把本实现注入 TargetRegistry.
+//   推荐阅读顺序: encodeInstruction -> encodeInstruction<32> -> getMachineOpValue
+//     (TableGen 自动生成, 每个 opcode 一个, 这里只是 dispatcher).
+//   所有 NT 注释均以 "// <NT>" 开头, 方便搜索定位.
 #include "MCTargetDesc/RISCVBaseInfo.h"
 #include "MCTargetDesc/RISCVFixupKinds.h"
 #include "MCTargetDesc/RISCVMCAsmInfo.h"

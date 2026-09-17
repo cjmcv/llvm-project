@@ -6,6 +6,35 @@
 //
 //===----------------------------------------------------------------------===//
 
+// <NT> 文件简介:
+//   RISCVELFObjectWriter.cpp 实现 ELF 对象文件写入器 (RISCV 专属标记层).
+//   MCELFObjectWriter 子类, 在 MCAssembler 输出 ELF 时被调用, 负责
+//   设置 e_flags / e_ident 等 RISC-V 专属字段. 上游 MCAssembler, 下游
+//   ld.lld / GNU ld 等 RISC-V ELF 链接器.
+//
+// <NT> 关键函数串联:
+//   工厂入口:
+//     createRISCVELFObjectWriter   被 TargetRegistry::RegisterELFObjectWriter 注册
+//   标记生成:
+//     GetOSFlags (RISCVELFObjectWriter override)
+//       ├─ EF_RISCV_RVC               压缩指令已用 (c.ext / c.addi 等)
+//       ├─ EF_RISCV_RVE               RV32E 嵌入式精简 ISA
+//       ├─ EF_RISCV_TSO               Total Store Ordering (替代 RVWMO 可选)
+//       └─ EF_RISCV_FLOAT_ABI_*       FPR 调用约定 (soft / single / double / quad)
+//   重定位支持:
+//     getRelocType (override MCELFObjectWriter)
+//       └─ 把 RISCVFixupKinds 映射到 R_RISCV_* ELF 重定位枚举.
+//
+// <NT> 总结:
+//   本文件是 RISC-V ELF 输出层. 三大职责:
+//     1) e_flags 设置: 把 RISC-V 专属特性 (RVC / RVE / TSO / Float ABI 等)
+//        编码进 ELF e_flags, 让链接器和运行时识别.
+//     2) 重定位类型映射: 把内部的 RISCVFixupKinds 枚举翻译为 ELF 标准
+//        R_RISCV_* 重定位条目.
+//     3) 工厂注册: 把本文件实现通过 RegisterELFObjectWriter 注入
+//        TargetRegistry, 让 TargetRegistry 在 riscv32/64 target 下使用.
+//   推荐阅读顺序: createRISCVELFObjectWriter -> GetOSFlags -> getRelocType.
+//   所有 NT 注释均以 "// <NT>" 开头, 方便搜索定位.
 #include "MCTargetDesc/RISCVFixupKinds.h"
 #include "MCTargetDesc/RISCVMCAsmInfo.h"
 #include "MCTargetDesc/RISCVMCTargetDesc.h"

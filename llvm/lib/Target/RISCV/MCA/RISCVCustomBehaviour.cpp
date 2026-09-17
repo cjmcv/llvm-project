@@ -10,6 +10,45 @@
 /// This file implements methods from the RISCVCustomBehaviour class.
 ///
 //===----------------------------------------------------------------------===//
+//
+// <NT> 文件简介:
+//   RISCVCustomBehaviour.cpp 实现 RISC-V 后端在 llvm-mca (LLVM Machine Code
+//   Analyzer) 中的自定义行为. 上游调用方: llvm-mca 工具启动时通过
+//   LLVMInitializeRISCVTargetInfo 注册, 读取 .mca 输入文件并按 DescName
+//   实例化对应的 Instrument 子类. 下游: 给 llvm-mca 的 Pipeline 注入回调,
+//   在每条 RVV 向量指令调度时检查 LMUL/SEW 状态一致性 (即"向量寄存器组
+//   是否会被错误地跨指令破坏"). 是 RVV (RISC-V "V" Vector Extension)
+//   性能建模的关键扩展.
+//
+// <NT> 关键类与调用链:
+//   顶层注册:
+//     RISCVInstrumentManager (manager)
+//       ├─ supportsInstrumentType()   判断是否支持某种 Instrument (LMUL/SEW/...)
+//       ├─ createInstrument()         工厂: 实例化对应 Instrument 子类
+//       └─ getSchedClassID()          把目标指令映射到调度类 ID
+//   行为实现:
+//     RISCVLMULInstrument            LMUL 一致性检查 (RVV 向量寄存器组)
+//       └─ isDataValid()             校验输入数据 (LMUL 值) 合法
+//     RISCVSEWInstrument             SEW 一致性检查 (RVV 标准元素宽度)
+//       └─ isDataValid()             校验输入数据 (SEW 值) 合法
+//     VXMemOpInfo                    RVV 段式访存指令 (vlse/vlxe/vsse/...) 的
+//                                    字段提取与缓存 (Log2IdxEEW / IsOrdered /
+//                                    IsStore / NFields)
+//
+// <NT> 总结:
+//   本文件为 llvm-mca 的 RISC-V 定制层. 三大职责:
+//     1) 提供 RVV 专属 Instrument 子类 (LMUL / SEW), 让 llvm-mca 能在
+//        调度模拟时检测向量寄存器组的隐式依赖关系 (跨指令的 LMUL
+//        冲突会导致寄存器别名 bug).
+//     2) 实现 InstrumentManager 工厂方法, 根据 .mca 配置文件中的
+//        "DescName" 字段 (如 RISCV-LMUL / RISCV-SEW) 实例化对应类.
+//     3) 提供 VXMemOpInfo 辅助解析 RVV 段式访存指令的字段, 给
+//        llvm-mca 的 memory pipeline 提供 EEW/Ordered/Store 信息.
+//   推荐阅读顺序: supportsInstrumentType -> isDataValid (LMUL/SEW)
+//     -> getSchedClassID.
+//   所有 NT 注释均以 "// <NT>" 开头, 方便搜索定位.
+//
+//===----------------------------------------------------------------------===//
 
 #include "RISCVCustomBehaviour.h"
 #include "MCTargetDesc/RISCVMCTargetDesc.h"
@@ -40,6 +79,15 @@ namespace mca {
 
 const llvm::StringRef RISCVLMULInstrument::DESC_NAME = "RISCV-LMUL";
 
+// <NT> LMUL Instrument 数据校验:
+//   调用链: llvm-mca 读取 .mca 文件, 发现 DescName="RISCV-LMUL" 时实例化
+//   RISCVLMULInstrument, 然后调 isDataValid 校验 Data 字段.
+//   关键机制: RVV 的 LMUL (Length Multiplier) 字段决定向量寄存器组的
+//   宽度, 值域为 m1/m2/m4/m8/f2/f4/f8 (即 1/2/4/8 个完整向量寄存器,
+//   或 1/2/1/2 个 fragment). 这里把 Data 按字符数组拆解, 检查每个字符
+//   都在合法集合 {m, f, 1, 2, 4, 8} 中. 失败返回 false 让 llvm-mca
+//   报错. 上下游: 上游 llvm-mca 配置加载, 下游 llvm-mca Pipeline 在调度
+//   每条 RVV 指令前会查 LMUL 一致性, 检测跨指令的向量寄存器别名冲突.
 bool RISCVLMULInstrument::isDataValid(llvm::StringRef Data) {
   // Return true if not one of the valid LMUL strings
   return StringSwitch<bool>(Data)
@@ -65,6 +113,17 @@ uint8_t RISCVLMULInstrument::getLMUL() const {
 
 const llvm::StringRef RISCVSEWInstrument::DESC_NAME = "RISCV-SEW";
 
+// <NT> SEW Instrument 数据校验:
+//   调用链: 与 RISCVLMULInstrument::isDataValid 对偶, 在 .mca 文件里
+//   DescName="RISCV-SEW" 时被调用.
+//   关键机制: RVV 的 SEW (Selected Element Width) 决定每条向量 lane 的
+//   位宽, 值域为 8/16/32/64 (RV64 上) 或 8/16/32 (RV32 上). 这里把
+//   Data 字符串按 "e<num>" 格式拆解, 检查前缀是 'e' 且数字部分是
+//   8/16/32/64. 失败返回 false 让 llvm-mca 报错. 上下游: 上游 llvm-mca
+//   配置加载, 下游 llvm-mca Pipeline 在每条 RVV 算术指令调度前查 SEW
+//   一致性. 注意: SEW 与 LMUL 的组合有合法性约束 (如 SEW=64 + LMUL=m8
+//   非法), 那是 RISCVInstrInfo::isValidElementWidth 层的检查, 本函数
+//   只做单字段校验.
 bool RISCVSEWInstrument::isDataValid(llvm::StringRef Data) {
   // Return true if not one of the valid SEW strings
   return StringSwitch<bool>(Data)
@@ -84,6 +143,17 @@ uint8_t RISCVSEWInstrument::getSEW() const {
       .Case("E64", 64);
 }
 
+// <NT> InstrumentManager 类型支持判断 (工厂前置):
+//   调用链: llvm-mca 在解析 .mca 文件 "DescName" 字段时会查
+//   InstrumentManager::supportsInstrumentType, 决定能否实例化对应
+//   Instrument.
+//   关键机制: 遍历 ManagerName 字符串数组 (RISCV-LMUL / RISCV-SEW 等),
+//   找到匹配项就返回 true. 同时 lazy 实例化对应的 Instrument 子类,
+//   把指针缓存进 instrument map. 失败返回 false, 让 llvm-mca 报错
+//   "unsupported instrument type". 上下游: 上游 llvm-mca 配置加载,
+//   下游 RISCVLMULInstrument::isDataValid / RISCVSEWInstrument::isDataValid.
+//   注意: 每次调用都会重新执行 lazy init 检查, 但实例本身只构造一次,
+//   靠 C++ static 局部变量保证线程安全 + 单次初始化.
 bool RISCVInstrumentManager::supportsInstrumentType(
     llvm::StringRef Type) const {
   return Type == RISCVLMULInstrument::DESC_NAME ||
@@ -181,6 +251,21 @@ RISCVInstrumentManager::createInstruments(const MCInst &Inst) {
   return SmallVector<UniqueInstrument>();
 }
 
+// <NT> RVV 段式访存指令字段提取 (VXMemOpInfo 缓存层):
+//   调用链: llvm-mca 在调度 RVV 段式访存指令 (vlse / vlxe / vsse / vsxe
+//   等) 时调 getVXMemOpInfo, 内部 cache miss 时调本函数.
+//   关键机制: 从 MCInst 的 operands 里提取四个字段:
+//     - Log2IdxEEW (3 bits): Indexed Element Width 的 log2 值 (3/4/5/6
+//       对应 8/16/32/64 位), 决定访存时单步元素宽度.
+//     - IsOrdered (1 bit): 是否为 ordered 段式 (vlxe/vsxe 才有), 影响
+//       llvm-mca 的 memory dependence model.
+//     - IsStore (1 bit): 是 load 还是 store, 影响 memory pipeline.
+//     - NFields (4 bits): 段数 (segment count), e.g. vlseg2e8 是 2 段.
+//   返回 std::pair<Info, NF>: Info 是 VXMemOpInfo 紧凑结构, NF 是字段数
+//   (供后续 MCInst operand 索引). 上下游: 上游 llvm-mca 调度, 下游
+//   MemoryAccess / WriteState 状态机按 EEW 设置依赖关系.
+//   注意: 本函数假设 MCInst opcode 已经被识别为 RVV 段式访存; 不做
+//   opcode 校验, 失败由调用方负责.
 static std::pair<uint8_t, uint8_t>
 getEEWAndEMUL(unsigned Opcode, RISCVVType::VLMUL LMUL, uint8_t SEW) {
   uint8_t EEW;
@@ -234,6 +319,21 @@ static bool opcodeHasEEWAndEMULInfo(unsigned short Opcode) {
          Opcode == RISCV::VLSE64_V || Opcode == RISCV::VSSE64_V;
 }
 
+// <NT> 调度类 ID 查询 (RISCVInstrumentManager::getSchedClassID):
+//   调用链: llvm-mca 的 Pipeline 在调度每条 MCInst 时, 调
+//   InstrumentManager::getSchedClassID 把目标指令映射到 RISCV 调度类 ID,
+//   供 llvm-mca 内部 Stage / Scheduler 查表用.
+//   关键机制: 用 TargetSchedModel (Subtarget 持有) 的
+//   resolveSchedClass(MCInst) 拿到 SchedClass 编号, 然后转成全局 MCProcIdx
+//   (即 RISCV 调度模型中的索引). 同时处理 RVV 指令的 VTYPE 状态机:
+//     - 第一次遇到 RVV 指令时, 把当前 LMUL/SEW/TA/MA 缓存进
+//       LastVTYPEState, 让后续 vset{i}vli 状态变更能被追踪.
+//     - 若当前指令是 vset{i}vli 本身, 更新 LastVTYPEState, 这样下游
+//       的 RVV 算术指令会按新的 LMUL/SEW 计算依赖.
+//   上下游: 上游 llvm-mca Pipeline (每条 MCInst 调度前), 下游
+//   llvm-mca Scheduler::dispatch 按 SchedClassID 查 ReadAdvance / WriteRes.
+//   注意: VTYPE 状态仅缓存到 LLVMContext 单实例, 跨函数不持久化
+//   (llvm-mca 不模拟控制流), 这是简化模型.
 unsigned RISCVInstrumentManager::getSchedClassID(
     const MCInstrInfo &MCII, const MCInst &MCI,
     const llvm::SmallVector<Instrument *> &IVec) const {

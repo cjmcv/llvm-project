@@ -10,6 +10,35 @@
 //
 //===----------------------------------------------------------------------===//
 
+// <NT> 文件简介:
+//   RISCVELFStreamer.cpp 实现 MCELFStreamer 子类 (RISCVELFStreamer), 是
+//   汇编流层 (Streamer) 的 RISC-V 入口. 上游 RISCVAsmParser / RISCVTargetStreamer,
+//   下游 MCAssembler. 是 TargetStreamer 与 MCStreamer 框架的衔接层.
+//
+// <NT> 关键函数串联 (汇编流层的主流程):
+//   工厂入口:
+//     createRISCVELFStreamer     注册到 TargetRegistry::RegisterELFStreamer
+//   状态同步 (.option 指令处理):
+//     RISCVELFStreamer::emitDirectiveOption
+//       ├─ .option arch X      转发给 TargetStreamer -> resetToArch
+//       ├─ .option rvc/norvc   切换 Subtarget 的 RVC 标志
+//       ├─ .option push/pop    压栈 / 弹栈 .option 状态
+//       └─ .option relax/norelax 切换 linker relaxation 开关
+//   数据 / 指令发射:
+//     emitValueImpl           覆盖基类, 同步 emit 到 TargetStreamer
+//     emitInstruction         包装基类, 让 TargetStreamer 看到每条 MCInst
+//   注: 本文件主要工作是"在基类回调里插入 TargetStreamer 钩子", 不重做
+//   编码逻辑. 真正的指令编码在 RISCVMCCodeEmitter.cpp.
+//
+// <NT> 总结:
+//   本文件是汇编流层 (Streamer) 的 RISC-V 适配. 三大职责:
+//     1) .option 指令处理: 在汇编过程中切换 -march / rvc / relax 等
+//        编译选项, 同步 Subtarget 状态, 影响后续指令编码.
+//     2) TargetStreamer 钩子: 把 MCStreamer 的 emit 回调转发给
+//        RISCVTargetStreamer, 让它维护 .attribute / VTYPE 等状态.
+//     3) 工厂注册: 让 RISCV target 使用本文件实现的 ELF streamer 路径.
+//   推荐阅读顺序: createRISCVELFStreamer -> emitDirectiveOption -> emitInstruction.
+//   所有 NT 注释均以 "// <NT>" 开头, 方便搜索定位.
 #include "RISCVELFStreamer.h"
 #include "RISCVAsmBackend.h"
 #include "RISCVBaseInfo.h"

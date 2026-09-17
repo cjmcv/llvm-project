@@ -10,6 +10,41 @@
 //
 //===----------------------------------------------------------------------===//
 
+// <NT> 文件简介:
+//   RISCVInstPrinter.cpp 实现 RISCVInstPrinter 子类, 把 MCInst 反向打印成
+//   人类可读的汇编文本 (或汇编输出 .s 文件). 上游 llvm-objdump -d /
+//   llvm-mca -disassemble / clang -S / RISCVAsmPrinter; 下游无 (打印即终点).
+//   与 RISCVDisassembler.cpp 的关系: Disassembler 把二进制 -> MCInst,
+//   InstPrinter 把 MCInst -> 助记符文本, 两者配合完成反汇编流水线.
+//
+// <NT> 关键函数串联 (单条指令打印主流程):
+//   printInstruction             顶层入口, 按 opcode 分派打印策略
+//     ├─ printAliasInstr         先尝试 GCC 兼容别名 (如 "ret" -> "jalr x0, ra, 0")
+//     ├─ printInst                默认助记符打印, 按 RV32I/RV64I/RVC/RVV 分派
+//     │   ├─ printRInst         R-type (add/sub/and/or/...)
+//     │   ├─ printIInst         I-type (addi/lw/sw/...)
+//     │   ├─ printSInst         S-type (sw/sh/sb)
+//     │   ├─ printBInst         B-type (beq/bne/blt/...)
+//     │   ├─ printUInst         U-type (lui/auipc)
+//     │   ├─ printJInst         J-type (jal/j)
+//     │   ├─ printCompressInst  RVC 压缩指令 (c.addi / c.lwsp / ...)
+//     │   └─ printVecInst       RVV 向量指令 (vadd.vv / vle32.v / ...)
+//     └─ printOperand           单个操作数打印 (含寄存器名 ABI 别名)
+//   特殊域打印:
+//     printVTypeIOperand         RVV vtype 即时值 (e32, m1, ta, ma)
+//     printFRMArg                浮点舍入模式 (rne/rtz/rdn/rup/rmm)
+//     printRegList               寄存器列表 (cm.push/pop 的 ra, s0-s11)
+//
+// <NT> 总结:
+//   本文件是 MCInst -> 助记符的打印层. 三大职责:
+//     1) 助记符反查: 把 MCInst 的 opcode 映射回人类可读的助记符 (含
+//        GCC 别名, 如 ret / nop / mv / not / sext.w 等).
+//     2) 操作数打印: 按指令格式 (R/I/S/B/U/J/RVC/RVV) 把每个操作数
+//        (寄存器 / 立即数 / 内存 / vtype / FRM / 寄存器列表) 格式化成
+//        标准汇编文本.
+//     3) ABI 别名: 优先打印 ABI 别名 (sp/gp/tp/ra/...) 而非数字名 (x2/x3/...).
+//   推荐阅读顺序: printInstruction -> printInst -> printRInst/IInst/... -> printOperand.
+//   所有 NT 注释均以 "// <NT>" 开头, 方便搜索定位.
 #include "RISCVInstPrinter.h"
 #include "RISCVBaseInfo.h"
 #include "RISCVMCAsmInfo.h"

@@ -10,6 +10,41 @@
 //
 //===----------------------------------------------------------------------===//
 
+// <NT> 文件简介:
+//   RISCVTargetStreamer.cpp 实现 TargetStreamer 子类, 维护汇编过程中 RISC-V
+//   专属状态: 当前 VTYPE / 当前 ABI / .option arch 后的新 Subtarget / .attribute
+//   收集等. 上游 RISCVAsmParser (解析 .option / .attribute) + RISCVELFStreamer
+//   (在 emit 钩子里回调本类); 下游 RISCVAsmPrinter 在输出 ELF 时把状态写入
+//   .riscv.attributes 段.
+//
+// <NT> 关键函数串联 (.option 指令主流程):
+//   状态同步 (与 RISCVELFStreamer 紧密配合):
+//     emitDirectiveOption       统一入口, 按 Arch/Relax/RVC 等子开关分派
+//       ├─ resetToArch         切换 Subtarget 的 -march 子集
+//       ├─ setPic/Relax/RVC    切换 PIC / 链接器 relaxation / RVC 标志
+//       └─ updateABI / updateFlags   把当前 ABI / Feature 写入 .riscv.attributes
+//   状态存储:
+//     ArchString / ArchStringStack   维护 .option push/pop 的 ISA 字符串栈
+//     CurrentVendor / AttributeSection   待写入 ELF 的属性表
+//   .attribute 指令:
+//     emitAttribute / emitTextAttribute / emitIntTextAttribute
+//                                  把汇编源中的 .attribute X, Y 翻译成
+//                                  MCELFStreamer 的 setAttributeItem 调用
+//
+//   注: 本文件是"汇编期状态机", 把每条 .option / .attribute 翻译成后续
+//      emit 时需要的 Subtarget 变更和属性表条目.
+//
+// <NT> 总结:
+//   本文件是 RISC-V 汇编期状态管理层. 三大职责:
+//     1) .option 处理: 在汇编过程中切换 -march 子集 / RVC / Relaxation,
+//        同步 Subtarget 状态, 让后续指令编码跟着切换.
+//     2) .attribute 收集: 把汇编源中的 .attribute 指令累积到 .riscv.attributes
+//        段, 输出 ELF 时由 RISCVELFStreamer::finishAttributeSection 落盘.
+//     3) ISA 字符串维护: 维护 ArchString 栈 (push/pop) + InitialArchString,
+//        让 $x<ISA> mapping symbol 能正确反映当前活跃 ISA.
+//   推荐阅读顺序: emitDirectiveOption -> resetToArch -> emitAttribute ->
+//      看 RISCVELFStreamer 的 finish() 如何落盘 e_flags.
+//   所有 NT 注释均以 "// <NT>" 开头, 方便搜索定位.
 #include "RISCVTargetStreamer.h"
 #include "RISCVBaseInfo.h"
 #include "RISCVMCTargetDesc.h"
