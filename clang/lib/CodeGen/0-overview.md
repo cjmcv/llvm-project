@@ -77,9 +77,8 @@ LLVM 后端负责。
 
 ### §0.2 与 `clang/lib/Frontend/` 的协作
 
-`clang/lib/Frontend` 提供 `CompilerInstance` (`clang/lib/Frontend/CompilerInstance.cpp`)
-+ `FrontendAction` (`clang/lib/Frontend/FrontendActions.cpp`); 本目录的
-[`CodeGenAction`](CodeGenAction.cpp) 是它的子类, 持有
+`clang/lib/Frontend` 提供 [`CompilerInstance`](../Frontend/CompilerInstance.cpp) + [`FrontendAction`](../Frontend/FrontendActions.cpp); 
+本目录的[`CodeGenAction`](CodeGenAction.cpp) 是它的子类, 持有
 [`BackendConsumer.h`](BackendConsumer.h), 把 ASTConsumer 跟 LLVM
 PassManager 串起来。
 
